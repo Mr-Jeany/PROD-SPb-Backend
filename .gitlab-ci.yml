@@ -1,0 +1,89 @@
+# .gitlab-ci.yml  — no-TLS DinD (HTTP:2375) to avoid "HTTP to HTTPS server" errors
+
+stages: [build, deploy]
+
+# ---------- Global build vars (NO TLS) ----------
+variables:
+  DOCKER_HOST: "tcp://docker:2375"     # talk HTTP to DinD
+  DOCKER_TLS_CERTDIR: ""               # disable TLS so client uses HTTP
+  DOCKER_DRIVER: overlay2
+  DOCKER_BUILDKIT: "1"
+
+  # Image build
+  DOCKERFILE: "Dockerfile"
+  DOCKER_CONTEXT: "."
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  IMAGE_TAG_LATEST: "latest"
+
+  # Runtime defaults
+  CONTAINER_NAME: "$CI_PROJECT_NAME"
+  INTERNAL_PORT: "8080"                # container port (gunicorn)
+  PUBLIC_PORT: "443"                    # host port
+  GUNICORN_APP: "app:app"
+  DATABASE_URL: "sqlite:///main.db"
+
+  # Extra docker run flags on remote
+  OPT_DOCKER: "-p 443:8080"
+# ===================== BUILD =====================
+build-image:
+  stage: build
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      # start daemon WITHOUT TLS on 2375 to match DOCKER_HOST above
+      command: ["--host=tcp://0.0.0.0:2375", "--tls=false", "--mtu=1460"]
+  before_script:
+    # quick sanity: should show tcp://docker:2375 and TLS: false
+    - echo "DOCKER_HOST=$DOCKER_HOST  DOCKER_TLS_CERTDIR=$DOCKER_TLS_CERTDIR"
+    - docker info || true
+    # Login to GitLab Container Registry
+    - echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - |
+      docker buildx build \
+        --file "${DOCKERFILE}" \
+        --progress=plain \
+        --tag  "${IMAGE_NAME}:${IMAGE_TAG}" \
+        --tag  "${IMAGE_NAME}:${IMAGE_TAG_LATEST}" \
+        --push \
+        "${DOCKER_CONTEXT}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH'           # build on any branch
+
+# ===================== DEPLOY =====================
+deploy-image:
+  stage: deploy
+  image: alpine:3.20
+  needs: ["build-image"]
+  variables:
+    SSH_USER: "$ENV_SSH_USER"
+    SSH_HOST: "$ENV_SSH_HOST"
+    SSH_ADDRESS: "$SSH_USER@$SSH_HOST"
+    SSH_PORT: "22"
+    SSH_PRIVATE_KEY_BASE64: "$ENV_PRIVATE_KEY_BASE64"
+    DOCKER_IMAGE_TO_RUN: "${IMAGE_NAME}:${IMAGE_TAG}"
+  before_script:
+    - apk add --no-cache openssh-client docker-cli bash
+    # Prepare SSH key from base64
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY_BASE64" | base64 -d | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+  script:
+    - echo $CI_REGISTRY_IMAGE
+    - AUTH_COMMAND="echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY --username $CI_REGISTRY_USER --password-stdin";
+    - ssh $SSH_ADDRESS "$AUTH_COMMAND"
+
+    - echo $CI_REGISTRY_IMAGE
+    - echo "$IMAGE_NAME $IMAGE_TAG"
+    - ssh $SSH_ADDRESS "docker pull $DOCKER_IMAGE_TO_RUN"
+
+      # Replace running container
+    - echo $CONTAINER_NAME
+    - ssh $SSH_ADDRESS "docker rm -f mainback || true"
+
+    - ssh $SSH_ADDRESS "docker run --name mainback --network sitenetwork -d $OPT_DOCKER $DOCKER_IMAGE_TO_RUN"
+
+      # Optional cleanup
+    - ssh $SSH_ADDRESS "docker image prune -f || true"
